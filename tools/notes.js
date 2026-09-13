@@ -13,6 +13,7 @@
 //     isAllowed,
 //     send,
 //     readJsonBody,
+//     author: "Lain",
 //   });
 //
 // `isAllowed(path)` must return a boolean — used to sandbox NOTES_DIR the
@@ -20,7 +21,9 @@
 // sandboxed. `send(res, status, body)` and `readJsonBody(req)` may be the
 // host's existing HTTP helpers (see lain's tools-agent/lib/http.js for a
 // reference implementation), or omitted to use the small built-in
-// fallbacks below.
+// fallbacks below. `author` is a fixed, host-supplied string (e.g. "Lain"
+// or "Asuna") stamped as YAML frontmatter on new/replaced notes — useful
+// when multiple assistants share the same notes folder/Obsidian vault.
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -66,8 +69,20 @@ function sanitizeNoteContent(content) {
   return content.replace(/\\n/g, "\n").replace(/\\t/g, "\t");
 }
 
+// Builds a YAML frontmatter block identifying which assistant wrote the
+// note (e.g. "Lain" or "Asuna") — useful when multiple assistants share
+// the same Obsidian vault/notes folder. `author` is a fixed, host-supplied
+// value (see registerRoutes' opts.author), never something the model
+// itself can set per-request.
+function buildFrontmatter(author) {
+  if (!author) return "";
+  return `---\nauthor: ${author}\ncreated: ${new Date().toISOString()}\n---\n\n`;
+}
+
 // isAllowed and notesDir must be supplied by the caller — see file header.
-function createNote(title, content, mode, { notesDir, isAllowed }) {
+// `author`, if supplied, is stamped as YAML frontmatter on new/replaced
+// notes (see buildFrontmatter above).
+function createNote(title, content, mode, { notesDir, isAllowed, author }) {
   content = sanitizeNoteContent(content);
   if (typeof isAllowed === "function" && !isAllowed(notesDir)) {
     throw new Error(
@@ -89,7 +104,7 @@ function createNote(title, content, mode, { notesDir, isAllowed }) {
     return { path: basePath, filename: baseFilename, mode: "appended" };
   }
   if (mode === "replace" && baseExists) {
-    const body = title ? `# ${title}\n\n${content || ""}\n` : `${content || ""}\n`;
+    const body = `${buildFrontmatter(author)}${title ? `# ${title}\n\n` : ""}${content || ""}\n`;
     fs.writeFileSync(basePath, body, "utf8");
     return { path: basePath, filename: baseFilename, mode: "replaced" };
   }
@@ -105,7 +120,7 @@ function createNote(title, content, mode, { notesDir, isAllowed }) {
     n++;
   }
 
-  const body = title ? `# ${title}\n\n${content || ""}\n` : `${content || ""}\n`;
+  const body = `${buildFrontmatter(author)}${title ? `# ${title}\n\n` : ""}${content || ""}\n`;
   fs.writeFileSync(fullPath, body, "utf8");
   return { path: fullPath, filename, mode: "created" };
 }
@@ -156,9 +171,12 @@ const toolDefinition = {
 
 // router: object with a `.post(path, handler)` method (see lain's
 // tools-agent/lib/http.js createRouter() for a reference implementation).
-// opts: { notesDir, isAllowed, send, readJsonBody } — see file header.
+// opts: { notesDir, isAllowed, send, readJsonBody, author } — see file
+// header. `author` is a fixed string identifying which assistant/host
+// project is writing the note (e.g. "Lain", "Asuna") — stamped as YAML
+// frontmatter on new/replaced notes, not settable by the model per-request.
 function registerRoutes(router, opts = {}) {
-  const { notesDir, isAllowed } = opts;
+  const { notesDir, isAllowed, author } = opts;
   const send = opts.send || defaultSend;
   const readJsonBody = opts.readJsonBody || defaultReadJsonBody;
 
@@ -175,7 +193,11 @@ function registerRoutes(router, opts = {}) {
       if (mode && !["create", "append", "replace"].includes(mode)) {
         return send(res, 400, { error: "mode must be create, append, or replace" });
       }
-      send(res, 200, createNote(title, content, mode || "create", { notesDir, isAllowed }));
+      send(
+        res,
+        200,
+        createNote(title, content, mode || "create", { notesDir, isAllowed, author })
+      );
     } catch (err) {
       send(res, 500, { error: err.message });
     }
