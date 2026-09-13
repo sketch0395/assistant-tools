@@ -111,25 +111,43 @@ function createNote(title, content, mode, { notesDir, isAllowed }) {
 }
 
 // Tool definition fragment for LLM function-calling — host projects can
-// spread/reuse this instead of retyping the same schema by hand.
+// spread/reuse this instead of retyping the same schema by hand. This is
+// the canonical, battle-tested description (refined from real usage
+// across projects) — host projects should prefer requiring this over
+// writing their own, and if a host-specific detail is needed (e.g. "on
+// the user's laptop"), append it rather than rewriting the whole thing,
+// so fixes/improvements made here don't have to be re-discovered per
+// project.
 const toolDefinition = {
   name: "create_note",
   description:
     "Create a new note, append to an existing note, or replace an existing " +
-    "note's contents. Notes are saved as markdown (.md) files. Use this " +
-    "when the user asks you to write something down or save a note.",
+    "note's content. Notes are saved as markdown (.md) files. Use this when " +
+    "the user asks to write something down, save a summary/list as a file, " +
+    "or add to an existing note by title — as opposed to remembering a " +
+    "short durable fact. Matching an existing note for append/replace mode " +
+    "is by exact title.",
   parameters: {
     type: "object",
     properties: {
-      title: { type: "string", description: "Title of the note (used as the filename)." },
-      content: { type: "string", description: "Body text of the note." },
+      title: {
+        type: "string",
+        description:
+          "Note title — used as the file name (sanitized) and as a " +
+          "top-level heading in the file. Also used to find an existing " +
+          "note for append/replace mode.",
+      },
+      content: { type: "string", description: "The note's body content, in markdown." },
       mode: {
         type: "string",
         enum: ["create", "append", "replace"],
         description:
-          "create (default): make a new note, never overwriting an existing " +
-          "one with the same title. append: add to the end of an existing " +
-          "note with this title. replace: overwrite an existing note's body.",
+          "'create' (default) always makes a brand-new, distinct note — use " +
+          "when the user wants a new note even if a similarly-titled one " +
+          "exists. 'append' adds this content to the end of the existing " +
+          "note with this exact title (e.g. 'add X to my grocery list'). " +
+          "'replace' overwrites the entire content of the existing note " +
+          "with this exact title.",
       },
     },
     required: ["title"],
