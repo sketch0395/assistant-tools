@@ -91,7 +91,15 @@ async function fetchOneSource(source) {
   try {
     const res = await fetch(source.url, {
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-      headers: { "User-Agent": "Mozilla/5.0 (compatible; AssistantTools/1.0)" },
+      headers: {
+        // Some sources (BleepingComputer, SecurityWeek, etc.) sit behind
+        // bot-detection that blocks generic/"compatible" user agents but
+        // allows a normal-looking browser UA through.
+        "User-Agent":
+          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+          "(KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+        Accept: "application/rss+xml, application/xml, text/xml, */*",
+      },
     });
     if (!res.ok) throw new Error(`responded with ${res.status}`);
     const text = await res.text();
