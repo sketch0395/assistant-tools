@@ -231,7 +231,9 @@ const toolDefinitions = {
       "if given, otherwise by the standing 'what to look for' watch terms " +
       "set via set_cyber_news_watch_terms, otherwise returns the latest " +
       "items unfiltered. Use this whenever the user asks for security news, " +
-      "threat intel headlines, or to check their configured feeds.",
+      "threat intel headlines, or to check their configured feeds. Each " +
+      "result includes a `link` field — always cite the source name and " +
+      "URL alongside any article you mention, never just the title.",
     parameters: {
       type: "object",
       properties: {
