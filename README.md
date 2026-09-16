@@ -72,6 +72,7 @@ git commit -m "Update shared tools submodule"
 | `add_threat_intel`, related lookups                                      | `tools/threatIntel.js`  | Threat-intel notes storage (DB-backed; host injects its own connection).     |
 | `fetch_web_page`                                                          | `tools/webFetch.js`     | Fetch and summarize a web page.                                              |
 | `shodan_host_lookup`, `shodan_search`, `shodan_dns_lookup`, `shodan_account_info` | `tools/shodan.js` | Shodan.io recon/exposure lookups (host injects its own API key).            |
+| `check_url_legitimacy`                                                    | `tools/urlProvenance.js` | Website provenance/legitimacy checker: redirect resolution, punycode/homograph detection, RDAP domain-age lookup, VirusTotal cross-reference (host injects its own API key). |
 | `ping_host`, `dns_lookup`, `traceroute_host`, `whois_lookup`, `port_scan`, `check_port`, `lan_device_scan`, `speed_test` | `tools/network.js` | Network diagnostics (runs on the tools-agent host/laptop, not in a container). |
 | `system_diagnostics`                                                      | `tools/diagnostics.js`  | Host health snapshot (uptime, load, memory, disk).                          |
 | hash/metadata/strings/pcap, processes, connections, logs, login history, packet capture | `tools/forensics.js` | Digital-forensics-style tools (path-restricted where filesystem-based).      |
