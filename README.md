@@ -64,9 +64,23 @@ git commit -m "Update shared tools submodule"
 
 ## Available tools
 
-| Tool        | File               | Description                                              |
-|-------------|--------------------|-----------------------------------------------------------|
-| `create_note` | `tools/notes.js` | Create/append/replace a markdown note file.               |
+| Tool(s)                                                                 | File                    | Description                                                                 |
+|--------------------------------------------------------------------------|-------------------------|------------------------------------------------------------------------------|
+| `create_note`                                                             | `tools/notes.js`        | Create/append/replace a markdown note file.                                  |
+| `find_files`, `search_files`, `read_file`, `list_directory`, `summarize_directory` | `tools/files.js` | Read-only filesystem browsing/searching.                                     |
+| `get_cyber_news`, source management                                      | `tools/cyberNews.js`    | Cybersecurity RSS/Atom news aggregator (DB-backed; host injects its own connection). |
+| `add_threat_intel`, related lookups                                      | `tools/threatIntel.js`  | Threat-intel notes storage (DB-backed; host injects its own connection).     |
+| `fetch_web_page`                                                          | `tools/webFetch.js`     | Fetch and summarize a web page.                                              |
+| `shodan_host_lookup`, `shodan_search`, `shodan_dns_lookup`, `shodan_account_info` | `tools/shodan.js` | Shodan.io recon/exposure lookups (host injects its own API key).            |
+| `ping_host`, `dns_lookup`, `traceroute_host`, `whois_lookup`, `port_scan`, `check_port`, `lan_device_scan`, `speed_test` | `tools/network.js` | Network diagnostics (runs on the tools-agent host/laptop, not in a container). |
+| `system_diagnostics`                                                      | `tools/diagnostics.js`  | Host health snapshot (uptime, load, memory, disk).                          |
+| hash/metadata/strings/pcap, processes, connections, logs, login history, packet capture | `tools/forensics.js` | Digital-forensics-style tools (path-restricted where filesystem-based).      |
+| Omarchy status/theme list/set/create (incl. from-image), generic `omarchy <args>` passthrough | `tools/omarchy.js` | Omarchy Linux desktop integration.                                          |
+| `extract_image_colors` (and theme-from-image support)                    | `tools/imageColors.js`  | Dominant-color palette extraction from a local image.                       |
+| desktop notifications (internal — used by reminders, not LLM-callable)   | `tools/notify.js`       | notify-send wrapper; host supplies its own app name.                        |
+| self-update (internal — e.g. `update_lain`/`update_asuna`)                | `tools/update.js`       | Kicks off the host project's own `scripts/update.sh`.                        |
+| grant tcpdump capture capability (internal, non-LLM, UI-triggered only)  | `tools/capabilities.js` | One narrow, explicitly-scoped `sudo setcap` action for packet capture.       |
+
 
 ## Adding a new shared tool
 
