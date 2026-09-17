@@ -13,6 +13,11 @@
 //      local `whois` binary or laptop agent needed, so this works
 //      entirely from inside the host's own sandboxed server/container).
 //   4. Cross-references VirusTotal's community detections for the URL.
+//   5. Submits/searches urlscan.io, which actually renders the page in a
+//      real (sandboxed, urlscan-hosted) browser and reports what it saw —
+//      final IP/ASN/server, TLS certificate age, and a malicious/phishing
+//      verdict. This is the closest thing to "actually visiting it" while
+//      keeping the visit itself off of the user's/host's own network.
 //
 // Framework-agnostic like shodan.js — no database, just an API key
 // supplied by the host app (env var), so Lain/Asuna (or anything else)
@@ -25,6 +30,10 @@ const RDAP_TIMEOUT_MS = 8000;
 const VT_TIMEOUT_MS = 15000;
 const VT_POLL_ATTEMPTS = 3;
 const VT_POLL_DELAY_MS = 3000;
+const URLSCAN_TIMEOUT_MS = 15000;
+const URLSCAN_POLL_ATTEMPTS = 6;
+const URLSCAN_POLL_DELAY_MS = 5000;
+const URLSCAN_SEARCH_MAX_AGE_DAYS = 7;
 const YOUNG_DOMAIN_DAYS = 90;
 const USER_AGENT = "Mozilla/5.0 (compatible; url-provenance-check/1.0)";
 
@@ -214,6 +223,14 @@ async function virusTotalReport(apiKey, targetUrl) {
   if (!apiKey) {
     return { available: false, reason: "VirusTotal isn't configured (no API key set)." };
   }
+  try {
+    return await virusTotalReportInner(apiKey, targetUrl);
+  } catch (err) {
+    return { available: false, reason: `VirusTotal lookup failed: ${err.message || err}` };
+  }
+}
+
+async function virusTotalReportInner(apiKey, targetUrl) {
   const urlId = toUrlSafeBase64(targetUrl);
 
   // Fast path: someone else may have already scanned this exact URL.
@@ -275,9 +292,137 @@ async function virusTotalReport(apiKey, targetUrl) {
   };
 }
 
+// --- 5. urlscan.io — actually renders the page in a sandboxed browser ------
+
+async function urlscanFetch(apiKey, path, opts = {}) {
+  const headers = { ...(opts.headers || {}) };
+  if (apiKey) headers["API-Key"] = apiKey;
+  const res = await fetch(`https://urlscan.io${path}`, {
+    ...opts,
+    headers,
+    signal: AbortSignal.timeout(URLSCAN_TIMEOUT_MS),
+  });
+  const text = await res.text();
+  let body;
+  try {
+    body = text ? JSON.parse(text) : {};
+  } catch {
+    body = { raw: text };
+  }
+  return { ok: res.ok, status: res.status, body };
+}
+
+function summarizeUrlscanResult(result, { freshlySubmitted } = {}) {
+  const page = result.page || {};
+  const verdicts = result.verdicts || {};
+  const overall = verdicts.overall || {};
+  return {
+    available: true,
+    uuid: result.task?.uuid || null,
+    permalink: result.task?.reportURL || (result.task?.uuid ? `https://urlscan.io/result/${result.task.uuid}/` : null),
+    screenshot: result.task?.screenshotURL || null,
+    malicious: Boolean(overall.malicious),
+    score: typeof overall.score === "number" ? overall.score : null,
+    categories: overall.categories || [],
+    brands: overall.brands || [],
+    finalUrl: page.url || null,
+    ip: page.ip || null,
+    country: page.country || null,
+    server: page.server || null,
+    asn: page.asn || null,
+    asnName: page.asnname || null,
+    tlsIssuer: page.tlsIssuer || null,
+    tlsAgeDays: typeof page.tlsAgeDays === "number" ? page.tlsAgeDays : null,
+    scanDate: result.task?.time || null,
+    freshlySubmitted: Boolean(freshlySubmitted),
+  };
+}
+
+function normalizeForCompare(u) {
+  return String(u || "").replace(/\/+$/, "").toLowerCase();
+}
+
+async function urlscanReport(apiKey, targetUrl) {
+  if (!apiKey) {
+    return { available: false, reason: "urlscan.io isn't configured (no API key set)." };
+  }
+  try {
+    return await urlscanReportInner(apiKey, targetUrl);
+  } catch (err) {
+    return { available: false, reason: `urlscan.io lookup failed: ${err.message || err}` };
+  }
+}
+
+async function urlscanReportInner(apiKey, targetUrl) {
+  // Fast path: search for a recent existing scan of this exact URL first —
+  // free (doesn't count against submission quota) and instant. "page.url"
+  // is a tokenized text field (fuzzy), so search by domain instead and
+  // filter for an exact URL match client-side rather than trusting
+  // relevance-sorted fuzzy hits.
+  const targetHostname = new URL(targetUrl).hostname;
+  const search = await urlscanFetch(
+    apiKey,
+    `/api/v1/search/?q=${encodeURIComponent(`page.domain:"${targetHostname}"`)}&size=10`
+  );
+  if (search.ok && Array.isArray(search.body?.results)) {
+    const normalizedTarget = normalizeForCompare(targetUrl);
+    const hit = search.body.results.find((r) => {
+      const ageDays = r.task?.time ? Math.floor((Date.now() - new Date(r.task.time).getTime()) / 86400000) : null;
+      if (ageDays !== null && ageDays > URLSCAN_SEARCH_MAX_AGE_DAYS) return false;
+      return (
+        normalizeForCompare(r.page?.url) === normalizedTarget || normalizeForCompare(r.task?.url) === normalizedTarget
+      );
+    });
+    if (hit) {
+      const resultRes = await urlscanFetch(apiKey, `/api/v1/result/${hit._id}/`);
+      if (resultRes.ok) return summarizeUrlscanResult(resultRes.body);
+    }
+  } else if (search.status === 429) {
+    return { available: false, reason: "urlscan.io rate limit hit — try again shortly." };
+  }
+
+  // No recent exact-match scan found — submit one. Unlisted: not on the
+  // public front-page/search, but still gets a real sandboxed-browser visit.
+  const submitted = await urlscanFetch(apiKey, "/api/v1/scan/", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url: targetUrl, visibility: "unlisted" }),
+  });
+  if (!submitted.ok) {
+    if (submitted.status === 429) {
+      return { available: false, reason: "urlscan.io rate limit hit — try again shortly." };
+    }
+    return {
+      available: false,
+      reason: `urlscan.io submission failed: ${submitted.body?.message || `HTTP ${submitted.status}`}`,
+    };
+  }
+  const uuid = submitted.body?.uuid;
+  if (!uuid) {
+    return { available: false, reason: "urlscan.io submission didn't return a scan id." };
+  }
+
+  // Result endpoint 404s until the scan finishes — the docs suggest an
+  // initial wait before polling, then a few retries.
+  await new Promise((resolve) => setTimeout(resolve, URLSCAN_POLL_DELAY_MS));
+  for (let i = 0; i < URLSCAN_POLL_ATTEMPTS; i++) {
+    const resultRes = await urlscanFetch(apiKey, `/api/v1/result/${uuid}/`);
+    if (resultRes.ok) return summarizeUrlscanResult(resultRes.body, { freshlySubmitted: true });
+    if (resultRes.status === 410) {
+      return { available: false, reason: "urlscan.io deleted this scan result before it could be read." };
+    }
+    await new Promise((resolve) => setTimeout(resolve, URLSCAN_POLL_DELAY_MS));
+  }
+  return {
+    available: false,
+    reason: "urlscan.io scan was just submitted and is still processing — ask again in a minute for results.",
+    permalink: `https://urlscan.io/result/${uuid}/`,
+  };
+}
+
 // --- Orchestration -----------------------------------------------------------
 
-function buildVerdict({ hostnameCheck, domainAge, vt }) {
+function buildVerdict({ hostnameCheck, domainAge, vt, urlscan }) {
   const reasons = [];
   let verdict = "insufficient data";
 
@@ -287,6 +432,16 @@ function buildVerdict({ hostnameCheck, domainAge, vt }) {
   } else if (vt.available && vt.stats?.suspicious > 0) {
     verdict = "suspicious";
     reasons.push(`VirusTotal: ${vt.stats.suspicious} security vendor(s) flagged this URL as suspicious.`);
+  }
+
+  if (urlscan.available && urlscan.malicious) {
+    verdict = "likely malicious";
+    reasons.push(
+      `urlscan.io flagged this page as malicious` +
+        (urlscan.categories?.length ? ` (${urlscan.categories.join(", ")})` : "") +
+        (urlscan.brands?.length ? `, impersonating: ${urlscan.brands.join(", ")}` : "") +
+        "."
+    );
   }
 
   if (domainAge.available && domainAge.isYoung) {
@@ -303,33 +458,43 @@ function buildVerdict({ hostnameCheck, domainAge, vt }) {
   }
 
   if (verdict === "insufficient data") {
-    if (vt.available && (vt.stats?.harmless ?? 0) > 0 && domainAge.available && !domainAge.isYoung) {
+    const vtClean = vt.available && (vt.stats?.harmless ?? 0) > 0;
+    const urlscanClean = urlscan.available && !urlscan.malicious;
+    const domainEstablished = domainAge.available && !domainAge.isYoung;
+    if ((vtClean || urlscanClean) && domainEstablished) {
       verdict = "likely legitimate";
+      const signals = [];
+      if (vtClean) signals.push("no VirusTotal vendors flagged it");
+      if (urlscanClean) signals.push("urlscan.io's sandboxed render found nothing malicious");
       reasons.push(
-        `VirusTotal: no vendors flagged this URL, and the domain has been registered for ` +
-          `${domainAge.ageDays} day(s).`
+        `${signals.join(" and ")}, and the domain has been registered for ${domainAge.ageDays} day(s).`
       );
     } else {
-      reasons.push("Not enough signal from VirusTotal/RDAP to reach a confident verdict — use your own judgment.");
+      reasons.push(
+        "Not enough signal from VirusTotal/urlscan.io/RDAP to reach a confident verdict — use your own judgment."
+      );
     }
   }
 
   return { verdict, reasons };
 }
 
-async function checkUrlLegitimacy(apiKey, inputUrl) {
+async function checkUrlLegitimacy(keys, inputUrl) {
+  const { virusTotalApiKey = "", urlscanApiKey = "" } = typeof keys === "string" ? { virusTotalApiKey: keys } : keys || {};
   const parsed = normalizeUrl(inputUrl);
   const redirectResult = await followRedirects(parsed);
   const finalUrl = redirectResult.finalUrl instanceof URL ? redirectResult.finalUrl : new URL(redirectResult.finalUrl);
   const hostnameCheck = analyzeHostname(finalUrl.hostname);
   const domainForRdap = getRegistrableDomain(finalUrl.hostname);
+  const finalUrlStr = redirectResult.finalUrl.toString ? redirectResult.finalUrl.toString() : String(redirectResult.finalUrl);
 
-  const [domainAge, vt] = await Promise.all([
+  const [domainAge, vt, urlscan] = await Promise.all([
     checkDomainAge(domainForRdap),
-    virusTotalReport(apiKey, redirectResult.finalUrl.toString ? redirectResult.finalUrl.toString() : String(redirectResult.finalUrl)),
+    virusTotalReport(virusTotalApiKey, finalUrlStr),
+    urlscanReport(urlscanApiKey, finalUrlStr),
   ]);
 
-  const { verdict, reasons } = buildVerdict({ hostnameCheck, domainAge, vt });
+  const { verdict, reasons } = buildVerdict({ hostnameCheck, domainAge, vt, urlscan });
 
   return {
     inputUrl: parsed.toString(),
@@ -339,6 +504,7 @@ async function checkUrlLegitimacy(apiKey, inputUrl) {
     hostname: hostnameCheck,
     domainAge,
     virusTotal: vt,
+    urlscan,
     verdict,
     reasons,
   };
@@ -351,10 +517,12 @@ const toolDefinition = {
     "link, before visiting or trusting it. Follows shortened-URL redirect chains " +
     "to find the real destination (without downloading/executing its content), " +
     "flags Unicode/punycode homograph tricks in the domain name, checks how long " +
-    "the domain has been registered (very new domains are a red flag), and " +
-    "cross-references VirusTotal's community detections. Use this whenever the " +
-    "user shares a suspicious link, a shortened URL (bit.ly, tinyurl, etc.), or " +
-    "asks 'is this site safe/legit'.",
+    "the domain has been registered (very new domains are a red flag), cross-" +
+    "references VirusTotal's community detections, and (via urlscan.io) has the " +
+    "page actually rendered in a real, sandboxed browser to catch phishing/brand " +
+    "impersonation and report its true IP/server/TLS certificate. Use this " +
+    "whenever the user shares a suspicious link, a shortened URL (bit.ly, " +
+    "tinyurl, etc.), or asks 'is this site safe/legit'.",
   parameters: {
     type: "object",
     properties: {
@@ -383,6 +551,7 @@ module.exports = {
   analyzeHostname,
   checkDomainAge,
   virusTotalReport,
+  urlscanReport,
   toolDefinition,
   CONFIRM_REQUIRED_TOOLS,
   describeToolCall,
