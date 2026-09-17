@@ -47,6 +47,14 @@ function ensureSchema(db) {
       INSERT INTO playbooks_fts(rowid, title, content, tags)
       VALUES (new.id, new.title, new.content, new.tags);
     END;
+    CREATE TABLE IF NOT EXISTS playbook_drafts (
+      conversation_id TEXT PRIMARY KEY,
+      category TEXT NOT NULL,
+      title TEXT NOT NULL,
+      tags TEXT NOT NULL DEFAULT '',
+      steps TEXT NOT NULL DEFAULT '[]',
+      updated_at REAL
+    );
   `);
 }
 
@@ -158,6 +166,102 @@ function searchPlaybooks(db, query, limit = MAX_SEARCH_RESULTS) {
   }
 }
 
+// --- Conversational drafting -------------------------------------------
+// Lets the assistant build up a playbook incrementally while talking it
+// through with the user in chat — one draft per conversation (rather than
+// trusting the model to silently reconstruct the whole thing from context
+// at the end), so state survives long conversations and each step is
+// durably recorded the moment it's described instead of only living in
+// the model's own recollection of the chat so far.
+
+function getPlaybookDraft(db, conversationId) {
+  if (!conversationId) return null;
+  const row = db
+    .prepare(`SELECT * FROM playbook_drafts WHERE conversation_id = ?`)
+    .get(conversationId);
+  if (!row) return null;
+  return {
+    category: row.category,
+    title: row.title,
+    tags: row.tags,
+    steps: JSON.parse(row.steps || "[]"),
+  };
+}
+
+/** Starts (or restarts) a playbook draft scoped to this conversation. */
+function startPlaybookDraft(db, conversationId, { category, title } = {}) {
+  if (!conversationId) throw new Error("conversationId is required");
+  const cat = String(category || "").trim();
+  const t = String(title || "").trim();
+  if (!cat) throw new Error("category is required");
+  if (!t) throw new Error("title is required");
+  db.prepare(
+    `INSERT INTO playbook_drafts (conversation_id, category, title, tags, steps, updated_at)
+     VALUES (?, ?, ?, '', '[]', ?)
+     ON CONFLICT(conversation_id) DO UPDATE SET
+       category = excluded.category, title = excluded.title,
+       tags = '', steps = '[]', updated_at = excluded.updated_at`
+  ).run(conversationId, cat, t, Date.now());
+  return { category: cat, title: t, tags: "", steps: [] };
+}
+
+/** Appends one step to the in-progress draft for this conversation. */
+function addPlaybookDraftStep(db, conversationId, step) {
+  const draft = getPlaybookDraft(db, conversationId);
+  if (!draft) {
+    throw new Error(
+      "No playbook draft in progress for this conversation — call start_playbook_draft first."
+    );
+  }
+  const s = String(step || "").trim();
+  if (!s) throw new Error("step is required");
+  const steps = [...draft.steps, s];
+  db.prepare(
+    `UPDATE playbook_drafts SET steps = ?, updated_at = ? WHERE conversation_id = ?`
+  ).run(JSON.stringify(steps), Date.now(), conversationId);
+  return { ...draft, steps };
+}
+
+/** Clears the in-progress draft for this conversation without saving it. */
+function discardPlaybookDraft(db, conversationId) {
+  const info = db
+    .prepare(`DELETE FROM playbook_drafts WHERE conversation_id = ?`)
+    .run(conversationId);
+  return info.changes > 0;
+}
+
+/**
+ * Turns the accumulated draft steps into a real, saved playbook (via
+ * addPlaybook) and clears the draft. Numbers the steps in the final
+ * content so the saved playbook reads as an ordered runbook.
+ */
+function finalizePlaybookDraft(db, conversationId, { tags } = {}) {
+  const draft = getPlaybookDraft(db, conversationId);
+  if (!draft) {
+    throw new Error(
+      "No playbook draft in progress for this conversation — call start_playbook_draft first."
+    );
+  }
+  if (draft.steps.length === 0) {
+    throw new Error("This draft has no steps yet — add at least one before finishing it.");
+  }
+  const content = draft.steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
+  const tagsStr =
+    tags !== undefined
+      ? Array.isArray(tags)
+        ? tags.join(", ")
+        : String(tags || "").trim()
+      : draft.tags;
+  const entry = addPlaybook(db, {
+    category: draft.category,
+    title: draft.title,
+    content,
+    tags: tagsStr,
+  });
+  discardPlaybookDraft(db, conversationId);
+  return entry;
+}
+
 const toolDefinitions = {
   lookup_playbook: {
     name: "lookup_playbook",
@@ -235,11 +339,99 @@ const toolDefinitions = {
       required: ["category", "title", "content"],
     },
   },
+  start_playbook_draft: {
+    name: "start_playbook_draft",
+    description:
+      "Begin building a new incident response playbook interactively, " +
+      "one step at a time, while talking it through with the user in " +
+      "chat — use this instead of add_playbook when the user wants to " +
+      "walk you through a process conversationally rather than dictate " +
+      "the whole thing at once (e.g. 'let's build a playbook for " +
+      "ransomware, step one is...'). Starts (or restarts, discarding any " +
+      "unfinished draft) a fresh draft for THIS conversation. After this, " +
+      "call add_playbook_step for each step as the user describes it, " +
+      "then finish_playbook_draft once they say it's complete.",
+    parameters: {
+      type: "object",
+      properties: {
+        category: {
+          type: "string",
+          description:
+            "Short grouping label for the incident type, e.g. " +
+            "'phishing', 'ransomware', 'account_compromise'.",
+        },
+        title: {
+          type: "string",
+          description: "Short title for the playbook being built.",
+        },
+      },
+      required: ["category", "title"],
+    },
+  },
+  add_playbook_step: {
+    name: "add_playbook_step",
+    description:
+      "Append one step to the playbook draft currently being built for " +
+      "this conversation (started with start_playbook_draft). Call this " +
+      "once per step as the user describes it in the conversation — " +
+      "don't wait and try to reconstruct all the steps at the end. " +
+      "Rephrase what they said into one clear, actionable step; don't " +
+      "just copy their raw sentence if it's rambling. Briefly confirm " +
+      "back what you recorded so they can correct it if needed.",
+    parameters: {
+      type: "object",
+      properties: {
+        step: {
+          type: "string",
+          description: "One clear, self-contained action for this step.",
+        },
+      },
+      required: ["step"],
+    },
+  },
+  view_playbook_draft: {
+    name: "view_playbook_draft",
+    description:
+      "Show the playbook draft currently being built for this " +
+      "conversation (its category, title, and steps recorded so far). " +
+      "Use this if the user asks to review, recap, or hear the steps so " +
+      "far before continuing or finishing.",
+    parameters: { type: "object", properties: {} },
+  },
+  finish_playbook_draft: {
+    name: "finish_playbook_draft",
+    description:
+      "Complete the in-progress playbook draft for this conversation and " +
+      "save it as a real playbook in the library (equivalent to " +
+      "add_playbook, but using the steps already recorded via " +
+      "add_playbook_step instead of one big block of content). Call this " +
+      "once the user confirms they're done describing steps. The draft " +
+      "is cleared after this succeeds.",
+    parameters: {
+      type: "object",
+      properties: {
+        tags: {
+          type: "string",
+          description: "Optional comma-separated keywords to help future search.",
+        },
+      },
+    },
+  },
+  discard_playbook_draft: {
+    name: "discard_playbook_draft",
+    description:
+      "Abandon the in-progress playbook draft for this conversation " +
+      "without saving it — use this if the user decides not to finish it " +
+      "or wants to start over from scratch.",
+    parameters: { type: "object", properties: {} },
+  },
 };
 
-// add_playbook mutates state and should go through the normal confirm/deny
-// flow (like create_note/add_threat_intel); lookup_playbook is read-only.
-const CONFIRM_REQUIRED_TOOLS = ["add_playbook"];
+// add_playbook/finish_playbook_draft both persist a real playbook and
+// should go through the normal confirm/deny flow (like create_note/
+// add_threat_intel); everything else here is read-only or scoped to an
+// unpersisted draft, so it's safe to run without confirmation.
+const CONFIRM_REQUIRED_TOOLS = ["add_playbook", "finish_playbook_draft"];
 
 function describeToolCall(name, args) {
   switch (name) {
@@ -247,6 +439,16 @@ function describeToolCall(name, args) {
       return `look up an incident playbook for "${args.query}"`;
     case "add_playbook":
       return `add "${args.title}" to the playbook library (${args.category})`;
+    case "start_playbook_draft":
+      return `start drafting a playbook: "${args.title}" (${args.category})`;
+    case "add_playbook_step":
+      return `add a step to the in-progress playbook draft`;
+    case "view_playbook_draft":
+      return `review the in-progress playbook draft`;
+    case "finish_playbook_draft":
+      return `save the in-progress playbook draft to the library`;
+    case "discard_playbook_draft":
+      return `discard the in-progress playbook draft`;
     default:
       return undefined;
   }
@@ -260,6 +462,11 @@ module.exports = {
   updatePlaybook,
   deletePlaybook,
   searchPlaybooks,
+  getPlaybookDraft,
+  startPlaybookDraft,
+  addPlaybookDraftStep,
+  discardPlaybookDraft,
+  finalizePlaybookDraft,
   toolDefinitions,
   CONFIRM_REQUIRED_TOOLS,
   describeToolCall,
