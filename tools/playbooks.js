@@ -229,17 +229,20 @@ function startPlaybookDraft(db, conversationId, { category, title, requiresRepor
   return { category: cat, title: t, tags: "", steps: [], requiresReport: !!reqReport };
 }
 
-/** Appends one step to the in-progress draft for this conversation. */
-function addPlaybookDraftStep(db, conversationId, step) {
+/** Appends one step (optionally under a named section) to the in-progress draft for this conversation. */
+function addPlaybookDraftStep(db, conversationId, stepInput) {
   const draft = getPlaybookDraft(db, conversationId);
   if (!draft) {
     throw new Error(
       "No playbook draft in progress for this conversation — call start_playbook_draft first."
     );
   }
+  const { step, section } =
+    typeof stepInput === "string" ? { step: stepInput, section: "" } : stepInput || {};
   const s = String(step || "").trim();
   if (!s) throw new Error("step is required");
-  const steps = [...draft.steps, s];
+  const sec = String(section || "").trim();
+  const steps = [...draft.steps, { section: sec, text: s }];
   db.prepare(
     `UPDATE playbook_drafts SET steps = ?, updated_at = ? WHERE conversation_id = ?`
   ).run(JSON.stringify(steps), Date.now(), conversationId);
@@ -256,9 +259,36 @@ function discardPlaybookDraft(db, conversationId) {
 
 /**
  * Turns the accumulated draft steps into a real, saved playbook (via
- * addPlaybook) and clears the draft. Numbers the steps in the final
- * content so the saved playbook reads as an ordered runbook.
+ * addPlaybook) and clears the draft. Steps recorded under the same named
+ * section (see addPlaybookDraftStep) are grouped and numbered together
+ * under a "## Section Title" heading, in the order each section was first
+ * used; steps with no section are numbered as one plain list, exactly
+ * like before named sections existed.
  */
+function renderDraftContent(steps) {
+  const groups = [];
+  for (const raw of steps) {
+    const { section, text } = typeof raw === "string" ? { section: "", text: raw } : raw || {};
+    const sec = String(section || "").trim();
+    let group = groups.find((g) => g.section === sec);
+    if (!group) {
+      group = { section: sec, items: [] };
+      groups.push(group);
+    }
+    group.items.push(String(text || ""));
+  }
+  // Put any unsectioned steps first (mirrors splitPlaybookSections' own
+  // "preamble" handling — content before the first heading), so mixing
+  // sectioned and unsectioned steps in one draft doesn't accidentally
+  // swallow the unsectioned ones into whatever section happens to be last.
+  groups.sort((a, b) => (a.section ? 1 : 0) - (b.section ? 1 : 0));
+  const sections = groups.map((g) => ({
+    title: g.section,
+    content: g.items.map((t, i) => `${i + 1}. ${t}`).join("\n"),
+  }));
+  return joinPlaybookSections(sections);
+}
+
 function finalizePlaybookDraft(db, conversationId, { tags } = {}) {
   const draft = getPlaybookDraft(db, conversationId);
   if (!draft) {
@@ -269,7 +299,7 @@ function finalizePlaybookDraft(db, conversationId, { tags } = {}) {
   if (draft.steps.length === 0) {
     throw new Error("This draft has no steps yet — add at least one before finishing it.");
   }
-  const content = draft.steps.map((s, i) => `${i + 1}. ${s}`).join("\n");
+  const content = renderDraftContent(draft.steps);
   const tagsStr =
     tags !== undefined
       ? Array.isArray(tags)
@@ -368,6 +398,61 @@ function playbookFilename(entry) {
   return `${slug(entry.category)}__${slug(entry.title)}.md`;
 }
 
+// --- Structured sections ---------------------------------------------------
+// Playbooks are still stored as one plain `content` string (no schema
+// change needed, and it stays a single field for search/export/the model
+// to read) — but the writing/editing UI presents it broken into named
+// sections (e.g. the standard incident-response phases), using Markdown
+// "## Section Title" headings as the delimiter. splitPlaybookSections /
+// joinPlaybookSections convert between that flat string and a
+// [{ title, content }] array, entirely losslessly for content that
+// already follows the convention. Content with no "## " headings at all
+// (older freeform playbooks, or anything imported from elsewhere) comes
+// back as a single untitled section so nothing is lost or misrepresented.
+
+const DEFAULT_PLAYBOOK_SECTIONS = [
+  "Preparation",
+  "Identification",
+  "Containment",
+  "Remediation",
+  "Recovery",
+  "Aftermath",
+];
+
+function splitPlaybookSections(content) {
+  const text = String(content || "").replace(/\r\n/g, "\n").trim();
+  if (!text) return [{ title: "", content: "" }];
+  const headingRe = /^##\s+(.+?)\s*$/gm;
+  const matches = [...text.matchAll(headingRe)];
+  if (matches.length === 0) return [{ title: "", content: text }];
+  const sections = [];
+  // Anything before the first "## " heading (rare, but don't drop it).
+  const preamble = text.slice(0, matches[0].index).trim();
+  if (preamble) sections.push({ title: "", content: preamble });
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].index + matches[i][0].length;
+    const end = i + 1 < matches.length ? matches[i + 1].index : text.length;
+    sections.push({
+      title: matches[i][1].trim(),
+      content: text.slice(start, end).trim(),
+    });
+  }
+  return sections;
+}
+
+function joinPlaybookSections(sections) {
+  const list = Array.isArray(sections) ? sections : [];
+  return list
+    .map((s) => {
+      const title = String(s?.title || "").trim();
+      const body = String(s?.content || "").trim();
+      if (!title && !body) return "";
+      return title ? `## ${title}\n\n${body}` : body;
+    })
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 const toolDefinitions = {
   lookup_playbook: {
     name: "lookup_playbook",
@@ -438,9 +523,15 @@ const toolDefinitions = {
         content: {
           type: "string",
           description:
-            "The playbook steps, as a numbered/ordered list covering " +
-            "detection, containment, eradication, recovery, and " +
-            "follow-up/lessons-learned as applicable.",
+            "The playbook steps, broken into named sections using " +
+            "Markdown '## Section Title' headings — one heading per " +
+            "phase, e.g. '## Preparation', '## Identification', " +
+            "'## Containment', '## Remediation', '## Recovery', " +
+            "'## Aftermath' (use whichever of these apply, add custom " +
+            "section names if a phase doesn't fit, and skip phases with " +
+            "nothing to say). Each section's body should be a clear, " +
+            "ordered/numbered list of concrete steps to follow during a " +
+            "real incident, not just a description.",
         },
         tags: {
           type: "string",
@@ -504,13 +595,30 @@ const toolDefinitions = {
       "don't wait and try to reconstruct all the steps at the end. " +
       "Rephrase what they said into one clear, actionable step; don't " +
       "just copy their raw sentence if it's rambling. Briefly confirm " +
-      "back what you recorded so they can correct it if needed.",
+      "back what you recorded so they can correct it if needed. If the " +
+      "user is walking through this by incident-response phase (e.g. " +
+      "'step one is preparation...', 'next is identification...'), pass " +
+      "that phase as `section` so steps get grouped under it in the " +
+      "final playbook — typical phases are Preparation, Identification, " +
+      "Containment, Remediation, Recovery, and Aftermath, but use " +
+      "whatever section name fits what the user said, or omit it for a " +
+      "flat unsectioned list.",
     parameters: {
       type: "object",
       properties: {
         step: {
           type: "string",
           description: "One clear, self-contained action for this step.",
+        },
+        section: {
+          type: "string",
+          description:
+            "Optional phase/section this step belongs to (e.g. " +
+            "'Preparation', 'Identification', 'Containment', " +
+            "'Remediation', 'Recovery', 'Aftermath', or a custom name). " +
+            "Steps sharing the same section are grouped together under " +
+            "that heading in the final playbook. Omit for an unsectioned " +
+            "flat list.",
         },
       },
       required: ["step"],
@@ -569,7 +677,9 @@ function describeToolCall(name, args) {
     case "start_playbook_draft":
       return `start drafting a playbook: "${args.title}" (${args.category})`;
     case "add_playbook_step":
-      return `add a step to the in-progress playbook draft`;
+      return args.section
+        ? `add a step under "${args.section}" to the in-progress playbook draft`
+        : `add a step to the in-progress playbook draft`;
     case "view_playbook_draft":
       return `review the in-progress playbook draft`;
     case "finish_playbook_draft":
@@ -597,6 +707,9 @@ module.exports = {
   playbookToMarkdown,
   parsePlaybookMarkdown,
   playbookFilename,
+  DEFAULT_PLAYBOOK_SECTIONS,
+  splitPlaybookSections,
+  joinPlaybookSections,
   toolDefinitions,
   CONFIRM_REQUIRED_TOOLS,
   describeToolCall,
