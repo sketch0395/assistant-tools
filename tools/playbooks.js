@@ -56,10 +56,21 @@ function ensureSchema(db) {
       updated_at REAL
     );
   `);
+  // Added after the tables above already existed in deployed databases —
+  // CREATE TABLE IF NOT EXISTS won't retrofit a new column onto an
+  // existing table, so add it defensively and ignore the "duplicate
+  // column" error on databases that already have it.
+  for (const table of ["playbooks", "playbook_drafts"]) {
+    try {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN requires_report INTEGER NOT NULL DEFAULT 0`);
+    } catch {
+      // already has the column
+    }
+  }
 }
 
 /** Adds a new playbook. Returns the created row. */
-function addPlaybook(db, { category, title, content, tags } = {}) {
+function addPlaybook(db, { category, title, content, tags, requiresReport } = {}) {
   const cat = String(category || "").trim();
   const t = String(title || "").trim();
   const c = String(content || "").trim();
@@ -67,13 +78,21 @@ function addPlaybook(db, { category, title, content, tags } = {}) {
   if (!t) throw new Error("title is required");
   if (!c) throw new Error("content is required");
   const tagsStr = Array.isArray(tags) ? tags.join(", ") : String(tags || "").trim();
+  const reqReport = requiresReport ? 1 : 0;
   const now = Date.now();
   const info = db
     .prepare(
-      `INSERT INTO playbooks (category, title, content, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)`
+      `INSERT INTO playbooks (category, title, content, tags, requires_report, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)`
     )
-    .run(cat, t, c, tagsStr, now, now);
-  return { id: info.lastInsertRowid, category: cat, title: t, content: c, tags: tagsStr };
+    .run(cat, t, c, tagsStr, reqReport, now, now);
+  return {
+    id: info.lastInsertRowid,
+    category: cat,
+    title: t,
+    content: c,
+    tags: tagsStr,
+    requires_report: reqReport,
+  };
 }
 
 /** Lists every playbook, optionally filtered by category, most recent first. */
@@ -96,8 +115,8 @@ function listPlaybookCategories(db) {
     .map((r) => r.category);
 }
 
-/** Updates a playbook's content/title/category/tags. Returns the updated row, or null if not found. */
-function updatePlaybook(db, id, { category, title, content, tags } = {}) {
+/** Updates a playbook's content/title/category/tags/requiresReport. Returns the updated row, or null if not found. */
+function updatePlaybook(db, id, { category, title, content, tags, requiresReport } = {}) {
   const existing = db.prepare(`SELECT * FROM playbooks WHERE id = ?`).get(id);
   if (!existing) return null;
   const cat = category !== undefined ? String(category || "").trim() : existing.category;
@@ -109,13 +128,15 @@ function updatePlaybook(db, id, { category, title, content, tags } = {}) {
         ? tags.join(", ")
         : String(tags || "").trim()
       : existing.tags;
+  const reqReport =
+    requiresReport !== undefined ? (requiresReport ? 1 : 0) : existing.requires_report;
   if (!cat) throw new Error("category is required");
   if (!t) throw new Error("title is required");
   if (!c) throw new Error("content is required");
   db.prepare(
-    `UPDATE playbooks SET category = ?, title = ?, content = ?, tags = ?, updated_at = ? WHERE id = ?`
-  ).run(cat, t, c, tagsStr, Date.now(), id);
-  return { id, category: cat, title: t, content: c, tags: tagsStr };
+    `UPDATE playbooks SET category = ?, title = ?, content = ?, tags = ?, requires_report = ?, updated_at = ? WHERE id = ?`
+  ).run(cat, t, c, tagsStr, reqReport, Date.now(), id);
+  return { id, category: cat, title: t, content: c, tags: tagsStr, requires_report: reqReport };
 }
 
 /** Deletes a playbook by id. Returns true if a row was removed. */
@@ -185,24 +206,27 @@ function getPlaybookDraft(db, conversationId) {
     title: row.title,
     tags: row.tags,
     steps: JSON.parse(row.steps || "[]"),
+    requiresReport: !!row.requires_report,
   };
 }
 
 /** Starts (or restarts) a playbook draft scoped to this conversation. */
-function startPlaybookDraft(db, conversationId, { category, title } = {}) {
+function startPlaybookDraft(db, conversationId, { category, title, requiresReport } = {}) {
   if (!conversationId) throw new Error("conversationId is required");
   const cat = String(category || "").trim();
   const t = String(title || "").trim();
   if (!cat) throw new Error("category is required");
   if (!t) throw new Error("title is required");
+  const reqReport = requiresReport ? 1 : 0;
   db.prepare(
-    `INSERT INTO playbook_drafts (conversation_id, category, title, tags, steps, updated_at)
-     VALUES (?, ?, ?, '', '[]', ?)
+    `INSERT INTO playbook_drafts (conversation_id, category, title, tags, steps, requires_report, updated_at)
+     VALUES (?, ?, ?, '', '[]', ?, ?)
      ON CONFLICT(conversation_id) DO UPDATE SET
        category = excluded.category, title = excluded.title,
-       tags = '', steps = '[]', updated_at = excluded.updated_at`
-  ).run(conversationId, cat, t, Date.now());
-  return { category: cat, title: t, tags: "", steps: [] };
+       tags = '', steps = '[]', requires_report = excluded.requires_report,
+       updated_at = excluded.updated_at`
+  ).run(conversationId, cat, t, reqReport, Date.now());
+  return { category: cat, title: t, tags: "", steps: [], requiresReport: !!reqReport };
 }
 
 /** Appends one step to the in-progress draft for this conversation. */
@@ -257,6 +281,7 @@ function finalizePlaybookDraft(db, conversationId, { tags } = {}) {
     title: draft.title,
     content,
     tags: tagsStr,
+    requiresReport: draft.requiresReport,
   });
   discardPlaybookDraft(db, conversationId);
   return entry;
@@ -358,7 +383,12 @@ const toolDefinitions = {
       "playbook is found, follow it: walk the user through its steps in " +
       "order, in your own words, don't just paste it verbatim. If nothing " +
       "matches, say so plainly and fall back to general incident-response " +
-      "best practice.",
+      "best practice. IMPORTANT: if the playbook returned has " +
+      "requires_report: true, this is a tracked incident — call " +
+      "start_incident_report right away (don't wait to be asked), use " +
+      "log_incident_entry as you go through steps/findings/actions, and " +
+      "call finish_incident_report proactively once the incident is " +
+      "resolved / all steps are done.",
     parameters: {
       type: "object",
       properties: {
@@ -416,6 +446,15 @@ const toolDefinitions = {
           type: "string",
           description: "Optional comma-separated keywords to help future search.",
         },
+        requires_report: {
+          type: "boolean",
+          description:
+            "Set true if incidents handled with this playbook should end " +
+            "in a written incident report (significant incidents like " +
+            "ransomware, breach, data exfiltration). Set false for quick " +
+            "procedures that don't warrant one (e.g. 'lost badge'). " +
+            "Defaults to false if omitted.",
+        },
       },
       required: ["category", "title", "content"],
     },
@@ -444,6 +483,13 @@ const toolDefinitions = {
         title: {
           type: "string",
           description: "Short title for the playbook being built.",
+        },
+        requires_report: {
+          type: "boolean",
+          description:
+            "Set true if incidents handled with this playbook should end " +
+            "in a written incident report (significant incidents like " +
+            "ransomware, breach, data exfiltration). Defaults to false.",
         },
       },
       required: ["category", "title"],
