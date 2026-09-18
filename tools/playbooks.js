@@ -262,6 +262,87 @@ function finalizePlaybookDraft(db, conversationId, { tags } = {}) {
   return entry;
 }
 
+// --- Markdown import/export ---------------------------------------------
+// Lets a playbook be handed off as a single portable .md file (or a folder
+// of them, zipped) — for backing up the library, editing steps in a real
+// editor/Obsidian, sharing one playbook with someone else, or restoring
+// from a previous export. Round-trips category/title/tags via a small
+// YAML-ish frontmatter block so nothing is lost going out and back in.
+
+function escapeFrontmatterValue(v) {
+  const s = String(v ?? "");
+  // Quote if it has anything that would break a naive "key: value" line.
+  if (/[:#\n]/.test(s) || s !== s.trim()) {
+    return `"${s.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+  }
+  return s;
+}
+
+function unescapeFrontmatterValue(v) {
+  const s = String(v ?? "").trim();
+  if (s.startsWith('"') && s.endsWith('"')) {
+    return s.slice(1, -1).replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+  }
+  return s;
+}
+
+/** Renders one playbook as a single Markdown file with a frontmatter header. */
+function playbookToMarkdown(entry) {
+  const lines = [
+    "---",
+    `title: ${escapeFrontmatterValue(entry.title)}`,
+    `category: ${escapeFrontmatterValue(entry.category)}`,
+    `tags: ${escapeFrontmatterValue(entry.tags || "")}`,
+    "---",
+    "",
+    `# ${entry.title}`,
+    "",
+    String(entry.content || "").trim(),
+    "",
+  ];
+  return lines.join("\n");
+}
+
+/**
+ * Parses a Markdown file back into { title, category, tags, content }.
+ * Reads title/category/tags from frontmatter if present, falling back to
+ * `fallbackTitle` (e.g. derived from the uploaded filename) and an
+ * "uncategorized" bucket so an import never hard-fails just because the
+ * file wasn't originally exported from here.
+ */
+function parsePlaybookMarkdown(text, fallbackTitle = "Untitled Playbook") {
+  const raw = String(text || "").replace(/\r\n/g, "\n");
+  let body = raw;
+  const meta = {};
+  const fmMatch = raw.match(/^---\n([\s\S]*?)\n---\n?/);
+  if (fmMatch) {
+    body = raw.slice(fmMatch[0].length);
+    for (const line of fmMatch[1].split("\n")) {
+      const m = line.match(/^([A-Za-z_][\w-]*)\s*:\s*(.*)$/);
+      if (m) meta[m[1].toLowerCase()] = unescapeFrontmatterValue(m[2]);
+    }
+  }
+  // Strip a single leading "# Title" heading from the body if present —
+  // it's redundant with the frontmatter title / just a copy of it.
+  body = body.replace(/^\s*#\s+.+\n+/, "");
+  const title = String(meta.title || fallbackTitle || "Untitled Playbook").trim();
+  const category = String(meta.category || "uncategorized").trim() || "uncategorized";
+  const tags = String(meta.tags || "").trim();
+  const content = body.trim();
+  return { title, category, tags, content };
+}
+
+/** Safe-ish filename (no path separators/odd characters) for one exported playbook. */
+function playbookFilename(entry) {
+  const slug = (s) =>
+    String(s || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "untitled";
+  return `${slug(entry.category)}__${slug(entry.title)}.md`;
+}
+
 const toolDefinitions = {
   lookup_playbook: {
     name: "lookup_playbook",
@@ -467,6 +548,9 @@ module.exports = {
   addPlaybookDraftStep,
   discardPlaybookDraft,
   finalizePlaybookDraft,
+  playbookToMarkdown,
+  parsePlaybookMarkdown,
+  playbookFilename,
   toolDefinitions,
   CONFIRM_REQUIRED_TOOLS,
   describeToolCall,
