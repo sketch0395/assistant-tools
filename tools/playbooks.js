@@ -463,17 +463,25 @@ const toolDefinitions = {
       "report, ransomware detection, suspected account compromise, data " +
       "exfiltration, malware infection). ALWAYS call this the moment an " +
       "active or suspected incident is described, or the user explicitly " +
-      "asks 'what's the playbook for X' / 'do we have a runbook for this' " +
-      "— before improvising your own response steps. If a matching " +
-      "playbook is found, follow it: walk the user through its steps in " +
-      "order, in your own words, don't just paste it verbatim. If nothing " +
-      "matches, say so plainly and fall back to general incident-response " +
-      "best practice. IMPORTANT: if the playbook returned has " +
-      "requires_report: true, this is a tracked incident — call " +
-      "start_incident_report right away (don't wait to be asked), use " +
-      "log_incident_entry as you go through steps/findings/actions, and " +
-      "call finish_incident_report proactively once the incident is " +
-      "resolved / all steps are done.",
+      "asks to 'run' a playbook/runbook (e.g. 'run playbook " +
+      "ransomware: Ransomware Response', 'run the phishing playbook') — " +
+      "before improvising your own response steps. If a matching " +
+      "playbook is found, RUN it: call start_incident_report right away " +
+      "(don't wait to be asked, and regardless of requires_report — " +
+      "always track a playbook run so findings aren't lost), then walk " +
+      "the user through the playbook's steps in order in your own words " +
+      "(don't just paste it verbatim), calling log_incident_entry for " +
+      "each step/finding/action as it actually happens. IMPORTANT: " +
+      "running a playbook uses start_incident_report/log_incident_entry/" +
+      "finish_incident_report — it NEVER uses start_playbook_draft/" +
+      "add_playbook_step/finish_playbook_draft, which are a completely " +
+      "separate set of tools for AUTHORING a brand-new playbook to save " +
+      "to the library, not for executing one that already exists. If " +
+      "nothing matches, say so plainly and fall back to general " +
+      "incident-response best practice. When the user says to close " +
+      "out/wrap up/finish the playbook, call finish_incident_report — " +
+      "this is especially important (do it proactively, don't wait to " +
+      "be asked) when the playbook has requires_report: true.",
     parameters: {
       type: "object",
       properties: {
@@ -561,7 +569,13 @@ const toolDefinitions = {
       "ransomware, step one is...'). Starts (or restarts, discarding any " +
       "unfinished draft) a fresh draft for THIS conversation. After this, " +
       "call add_playbook_step for each step as the user describes it, " +
-      "then finish_playbook_draft once they say it's complete.",
+      "then finish_playbook_draft once they say it's complete. ONLY use " +
+      "this to author a brand-new playbook definition for the library. " +
+      "Do NOT use this (or add_playbook_step/finish_playbook_draft) when " +
+      "the user is actually RUNNING/executing an existing playbook found " +
+      "via lookup_playbook during a real or simulated incident — that " +
+      "case uses the entirely separate start_incident_report/" +
+      "log_incident_entry/finish_incident_report tools instead.",
     parameters: {
       type: "object",
       properties: {
@@ -624,6 +638,12 @@ const toolDefinitions = {
       required: ["step"],
     },
   },
+  // NOTE: start_playbook_draft/add_playbook_step/view_playbook_draft/
+  // finish_playbook_draft/discard_playbook_draft only ever author a new
+  // playbook DEFINITION for the library. Actually running/executing an
+  // existing playbook during an incident is a different job entirely and
+  // uses start_incident_report/log_incident_entry/finish_incident_report
+  // from incidentReports.js instead — see lookup_playbook's description.
   view_playbook_draft: {
     name: "view_playbook_draft",
     description:
@@ -641,7 +661,9 @@ const toolDefinitions = {
       "add_playbook, but using the steps already recorded via " +
       "add_playbook_step instead of one big block of content). Call this " +
       "once the user confirms they're done describing steps. The draft " +
-      "is cleared after this succeeds.",
+      "is cleared after this succeeds. This saves a playbook DEFINITION " +
+      "to the library — it is unrelated to closing out a live playbook " +
+      "run; for that, use finish_incident_report instead.",
     parameters: {
       type: "object",
       properties: {

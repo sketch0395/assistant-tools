@@ -321,13 +321,28 @@ function renderIncidentReportContent(draft) {
  * Completes the tracked incident for this conversation, compiles it into a
  * full Markdown report, saves it to the incident_reports library, and
  * clears the draft. Returns the saved report row.
+ *
+ * If no tracking was ever started for this conversation (the model closed
+ * out a playbook without calling start_incident_report first), falls back
+ * to starting one on the spot from the title/category/playbookTitle/summary
+ * given here, rather than failing outright and losing everything discussed
+ * so far — better to save a thin report than none at all.
  */
-function finalizeIncidentReport(db, conversationId, { tags } = {}) {
-  const draft = getIncidentReportDraft(db, conversationId);
+function finalizeIncidentReport(
+  db,
+  conversationId,
+  { tags, title, category, playbookTitle, summary } = {}
+) {
+  let draft = getIncidentReportDraft(db, conversationId);
   if (!draft) {
-    throw new Error(
-      "No incident is currently being tracked for this conversation — call start_incident_report first."
-    );
+    const t = String(title || playbookTitle || "").trim();
+    if (!t) {
+      throw new Error(
+        "No incident is currently being tracked for this conversation, and no title was given to " +
+          "start one — call start_incident_report first, or pass a title here to start-and-finish in one step."
+      );
+    }
+    draft = startIncidentReport(db, conversationId, { title: t, category, playbookTitle, summary });
   }
   const content = renderIncidentReportContent(draft);
   const entry = addIncidentReport(db, {
@@ -422,15 +437,23 @@ const toolDefinitions = {
   start_incident_report: {
     name: "start_incident_report",
     description:
-      "Begin tracking a real, currently-active security incident for " +
-      "reporting purposes. Call this right after lookup_playbook returns " +
-      "a matching playbook with requires_report: true — do this " +
-      "proactively, don't wait to be asked. Can also be used any time " +
-      "the user asks you to track/document/report on an incident, even " +
-      "without a matching playbook. Starts (or restarts, discarding any " +
-      "unfinished tracking) fresh tracking for THIS conversation. After " +
-      "this, call log_incident_entry as things happen during the " +
-      "incident, then finish_incident_report once it's resolved.",
+      "Begin tracking a real (or simulated/test) security incident for " +
+      "reporting purposes. This is how you RUN a playbook: call this " +
+      "right after lookup_playbook returns a match — do this " +
+      "proactively the moment you start walking the user through the " +
+      "playbook's steps, don't wait to be asked, and do it regardless of " +
+      "whether the playbook has requires_report: true (always track a " +
+      "playbook run so nothing is lost; requires_report just means you " +
+      "should push extra hard to finish_incident_report at the end " +
+      "without being asked). Can also be used any time the user asks you " +
+      "to track/document/report on an incident, even without a matching " +
+      "playbook. Starts (or restarts, discarding any unfinished " +
+      "tracking) fresh tracking for THIS conversation. After this, call " +
+      "log_incident_entry as things happen during the incident, then " +
+      "finish_incident_report once the user says to close out/wrap up/ " +
+      "finish the playbook. Do NOT confuse this with start_playbook_draft " +
+      "— that tool authors a brand-new playbook definition and has " +
+      "nothing to do with running one.",
     parameters: {
       type: "object",
       properties: {
@@ -506,15 +529,40 @@ const toolDefinitions = {
       "conversation, compile everything recorded into a full incident " +
       "report (summary, timeline, steps taken, findings, actions taken, " +
       "lessons learned), and save it to the incident report library. " +
-      "Call this proactively once the incident is resolved / all " +
-      "playbook steps are done — don't wait to be asked if the playbook " +
-      "required a report. The tracking is cleared after this succeeds.",
+      "This is what 'close out the playbook' / 'wrap this up' / 'finish " +
+      "the incident report' means — call it the moment the user says " +
+      "something like that. Also call it proactively once the incident " +
+      "is resolved / all playbook steps are done, without waiting to be " +
+      "asked, if the playbook required a report. If no tracking has been " +
+      "started yet (no start_incident_report call this conversation), " +
+      "pass title (and category/playbook_title/summary if known) to this " +
+      "same call — it will start-and-finish tracking in one step rather " +
+      "than failing and losing everything discussed so far. The " +
+      "tracking is cleared after this succeeds.",
     parameters: {
       type: "object",
       properties: {
         tags: {
           type: "string",
           description: "Optional comma-separated keywords to help future search.",
+        },
+        title: {
+          type: "string",
+          description:
+            "Fallback only — pass this if no start_incident_report was called yet this " +
+            "conversation, so a report can still be saved for the incident just discussed.",
+        },
+        category: {
+          type: "string",
+          description: "Fallback only, used together with `title` above.",
+        },
+        playbook_title: {
+          type: "string",
+          description: "Fallback only, used together with `title` above.",
+        },
+        summary: {
+          type: "string",
+          description: "Fallback only, used together with `title` above.",
         },
       },
     },
